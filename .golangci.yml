@@ -1,0 +1,96 @@
+version: "2"
+linters:
+  default: all
+  disable:
+    - cyclop
+    - depguard
+    - exhaustruct # deprecated in v2.13.0
+    - exhaustruct_v5
+    - funcorder # TODO: re-enable
+    - funlen
+    - gocognit
+    - gomodguard # deprecated in v2.12.0
+    - gosmopolitan
+    - inamedparam
+    - ireturn
+    - lll
+    - maintidx
+    - mnd
+    - nlreturn
+    - noinlineerr
+    - nonamedreturns
+    - protogetter
+    - testpackage
+    - wrapcheck
+    - wsl
+    - wsl_v5
+  settings:
+    errcheck:
+      check-type-assertions: true
+    forbidigo:
+      forbid:
+        - pattern: ^fmt\.Print
+        - pattern: ^log\.
+        - pattern: ^print$
+        - pattern: ^println$
+        - pattern: ^panic$
+    godox:
+      keywords:
+        - FIXME
+    varnamelen:
+      ignore-decls:
+        - T any
+        - i int
+        - wg sync.WaitGroup
+        - sb strings.Builder
+        - sb *strings.Builder
+        - ok bool
+        - op *operation
+        - op Operation
+        - t *ttStream
+        - rw *responseWriter
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - forbidigo
+          - funcorder
+          - gochecknoglobals
+          - gosec
+          - noctx
+          - noinlineerr
+        path: internal/examples/.*/.*\.go
+      - linters:
+          - dupl
+          - forcetypeassert
+          - goconst
+          - nilerr
+          - noctx
+          - prealloc
+        path: .*_test.go
+      - linters:
+          - gocritic
+        path: vanguard_examples_test.go
+      - linters:
+          - contextcheck
+        path: handler.go
+      - linters:
+          - goconst
+        path: params.go
+      - linters:
+          - gochecknoglobals
+        path: protocol.go
+        text: (allProtocols|protocolToString) is a global variable
+      - path: (.+)\.go$
+        text: "do not define dynamic errors, use wrapped static errors instead: .*"
+formatters:
+  enable:
+    - gci
+    - gofmt
+  exclusions:
+    generated: lax

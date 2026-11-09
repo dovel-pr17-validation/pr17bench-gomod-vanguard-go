@@ -1,0 +1,401 @@
+// Copyright 2023-2026 Buf Technologies, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package vanguard
+
+import (
+	"fmt"
+	"net/http"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/reflect/protoreflect"
+)
+
+func TestRouteTrie_Insert(t *testing.T) {
+	t.Parallel()
+	_ = initTrie(t)
+}
+
+func TestRouteTrie_InsertDuplicate(t *testing.T) {
+	t.Parallel()
+	var trie routeTrie
+	template, variables, err := parsePathTemplate("/foo%2fbar/*:%2c")
+	require.NoError(t, err)
+	testMethod := &method{descriptor: &fakeMethodDescriptor{name: "Dup"}}
+	target, err := makeTarget(testMethod, http.MethodGet, "", "", template, variables)
+	require.NoError(t, err)
+	require.NoError(t, trie.insert(http.MethodGet, target))
+	var existsErr alreadyExistsError
+	require.ErrorAs(t, trie.insert(http.MethodGet, target), &existsErr)
+	assert.Equal(t, "/foo%2Fbar/*:%2C", existsErr.pathPattern)
+}
+
+func TestRouteTrie_FindTarget(t *testing.T) {
+	t.Parallel()
+	testCases := []struct {
+		path         string
+		expectedPath string // if blank, path is expected to NOT match
+		expectedVars map[string]string
+	}{
+		{
+			path: "/bob/lob/law",
+		},
+		{
+			path:         "/foo/bar/baz",
+			expectedPath: "/foo/bar/{name}",
+			expectedVars: map[string]string{"name": "baz"},
+		},
+		{
+			path: "/foo/bob/lob/law",
+		},
+		{
+			path:         "/foo/bar/baz/buzz",
+			expectedPath: "/foo/bar/baz/buzz",
+		},
+		{
+			path:         "/foo/bar/baz/baz/buzz",
+			expectedPath: "/foo/bar/{name}/baz/{child}",
+			expectedVars: map[string]string{"name": "baz", "child": "buzz"},
+		},
+		{
+			path:         "/foo/bar/1/baz/2/buzz/3",
+			expectedPath: "/foo/bar/{name}/baz/{child.id}/buzz/{child.thing.id}",
+			expectedVars: map[string]string{"name": "1", "child.id": "2", "child.thing.id": "3"},
+		},
+		{
+			path: "/foo/bar/baz/123",
+		},
+		{
+			path:         "/foo/bar/baz/123/buzz",
+			expectedPath: "/foo/bar/*/{thing.id}/{cat=**}",
+			expectedVars: map[string]string{"thing.id": "123", "cat": "buzz"},
+		},
+		{
+			path:         "/foo/bar/baz/123/buzz/buzz",
+			expectedPath: "/foo/bar/*/{thing.id}/{cat=**}",
+			expectedVars: map[string]string{"thing.id": "123", "cat": "buzz/buzz"},
+		},
+		{
+			path:         "/foo/bar/baz/123/buzz/buzz:do",
+			expectedPath: "/foo/bar/*/{thing.id}/{cat=**}:do",
+			expectedVars: map[string]string{"thing.id": "123", "cat": "buzz/buzz"},
+		},
+		{
+			path:         "/foo/bar/baz/123/fizz/buzz/frob/nitz:do",
+			expectedPath: "/foo/bar/*/{thing.id}/{cat=**}:do",
+			expectedVars: map[string]string{"thing.id": "123", "cat": "fizz/buzz/frob/nitz"},
+		},
+		{
+			path:         "/foo/bar/baz/123/buzz/buzz:cancel",
+			expectedPath: "/foo/bar/*/{thing.id}/{cat=**}:cancel",
+			expectedVars: map[string]string{"thing.id": "123", "cat": "buzz/buzz"},
+		},
+		{
+			path: "foo/bar/baz/123/buzz/buzz:blah",
+		},
+		{
+			path:         "/foo/bar/my:weird:id",
+			expectedPath: "/foo/bar/{name}",
+			expectedVars: map[string]string{"name": "my:weird:id"},
+		},
+		{
+			path:         "/foo/bar/my%3Aweird%3Aid",
+			expectedPath: "/foo/bar/{name}",
+			expectedVars: map[string]string{"name": "my:weird:id"},
+		},
+		{
+			path:         "/foo/bar/a:b/baz/c:d",
+			expectedPath: "/foo/bar/{name}/baz/{child}",
+			expectedVars: map[string]string{"name": "a:b", "child": "c:d"},
+		},
+		{
+			path:         "/foo/bar/baz/123/a:b:do",
+			expectedPath: "/foo/bar/*/{thing.id}/{cat=**}:do",
+			expectedVars: map[string]string{"thing.id": "123", "cat": "a:b"},
+		},
+		{
+			path:         "/foo/bar/some:id/123/then:do",
+			expectedPath: "/foo/bar/*/{thing.id}/{cat=**}:do",
+			expectedVars: map[string]string{"thing.id": "123", "cat": "then"},
+		},
+		{
+			path:         "/foo/bar/baz/123/buzz:blah",
+			expectedPath: "/foo/bar/*/{thing.id}/{cat=**}",
+			expectedVars: map[string]string{"thing.id": "123", "cat": "buzz:blah"},
+		},
+		{
+			path:         "/foo/bob/bar/baz/123/details",
+			expectedPath: "/foo/bob/{book_id={author}/{isbn}/*}/details",
+			expectedVars: map[string]string{"book_id": "bar/baz/123", "author": "bar", "isbn": "baz"},
+		},
+		{
+			path: "/foo/bob/bar/baz/123/details:do",
+		},
+		{
+			path:         "/foo/blah/A/B/C/foo/D/E/F/G/foo/H/I/J/K/L/M:details",
+			expectedPath: "/foo/blah/{longest_var={long_var.a={medium.a={short.aa}/*/{short.ab}/foo}/*}/{long_var.b={medium.b={short.ba}/*/{short.bb}/foo}/{last=**}}}:details",
+			expectedVars: map[string]string{
+				"longest_var": "A/B/C/foo/D/E/F/G/foo/H/I/J/K/L/M",
+				"long_var.a":  "A/B/C/foo/D",
+				"medium.a":    "A/B/C/foo",
+				"short.aa":    "A",
+				"short.ab":    "C",
+				"long_var.b":  "E/F/G/foo/H/I/J/K/L/M",
+				"medium.b":    "E/F/G/foo",
+				"short.ba":    "E",
+				"short.bb":    "G",
+				"last":        "H/I/J/K/L/M",
+			},
+		},
+		{
+			// No trailing slash in the path, so this should not match.
+			path: "/trailing:slash",
+		},
+		{
+			// Trailing slash in the path, so this should match.
+			path:         "/trailing/:slash",
+			expectedPath: "/trailing/**:slash",
+		},
+		{
+			// Trailing verb, should not match.
+			path: "/verb:",
+		},
+		{
+			// No trailing verb, should match.
+			path:         "/verb",
+			expectedPath: "/verb",
+		},
+		{
+			// Var capture use path unescaping.
+			path:         "/foo/bar/baz/%2f/%2A/%2f",
+			expectedPath: "/foo/bar/*/{thing.id}/{cat=**}",
+			expectedVars: map[string]string{"thing.id": "/", "cat": "*/%2F"},
+		},
+		{
+			// A single-segment var decodes %2F to a literal slash.
+			// The multi-segment var enclosing it preserves %2F percent-encoded.
+			path:         "/percent_encoding/A%2Fb/suffix",
+			expectedPath: "/percent_encoding/{outer={inner}/suffix}",
+			expectedVars: map[string]string{
+				"inner": "A/b",          // single-segment: %2F decoded
+				"outer": "A%2Fb/suffix", // bounded multi-segment: %2F preserved
+			},
+		},
+		{
+			// A tail-spanning var ({cat=**}) also preserves %2F percent-encoded,
+			// consistent with all multi-segment vars.
+			path:         "/foo/bar/baz/123/a%2Fb",
+			expectedPath: "/foo/bar/*/{thing.id}/{cat=**}",
+			expectedVars: map[string]string{"thing.id": "123", "cat": "a%2Fb"},
+		},
+	}
+
+	trie := initTrie(t)
+
+	for _, testCase := range testCases {
+		t.Run(testCase.path, func(t *testing.T) {
+			t.Parallel()
+			var present, absent []string
+			if testCase.expectedPath != "" {
+				present = []string{http.MethodGet, http.MethodPost}
+				absent = []string{http.MethodDelete, http.MethodPut}
+			} else {
+				absent = []string{http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodPut}
+			}
+			for _, method := range present {
+				t.Run(method, func(t *testing.T) {
+					t.Parallel()
+					target, _ := trie.match(testCase.path, method)
+					require.NotNil(t, target)
+					require.Equal(t, protoreflect.Name(fmt.Sprintf("%s %s", method, testCase.expectedPath)), target.method.descriptor.Name())
+					require.Len(t, target.vars, len(testCase.expectedVars))
+					path := target.trimVerb(testCase.path)
+					for _, variable := range target.vars {
+						expectedValue, ok := testCase.expectedVars[variable.fieldPath]
+						assert.True(t, ok, variable.fieldPath)
+						value, err := variable.capture(path)
+						require.NoError(t, err)
+						require.Equal(t, expectedValue, value, variable.fieldPath)
+					}
+				})
+			}
+			for _, method := range absent {
+				t.Run(method, func(t *testing.T) {
+					t.Parallel()
+					target, _ := trie.match(testCase.path, method)
+					require.Nil(t, target)
+				})
+			}
+		})
+	}
+}
+
+func BenchmarkTrieMatch(b *testing.B) {
+	trie := initTrie(b)
+	path := "/foo/blah/A/B/C/foo/D/E/F/G/foo/H/I/J/K/L/M:details"
+	var (
+		method *routeTarget
+		vars   []string
+	)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		method, _ = trie.match(path, http.MethodPost)
+		if method == nil {
+			b.Fatal("method not found")
+		}
+		vars = vars[:0]
+		matched, _ := splitVerb(path)
+		for _, variable := range method.vars {
+			value, err := variable.capture(matched)
+			if err != nil {
+				b.Fatal(err)
+			}
+			vars = append(vars, value)
+		}
+	}
+	b.StopTimer()
+	assert.NotNil(b, method)
+	assert.Len(b, vars, 10)
+}
+
+func initTrie(tb testing.TB) *routeTrie {
+	tb.Helper()
+	var trie routeTrie
+	for _, route := range []string{
+		"/foo/bar/baz/buzz",
+		"/foo/bar/{name}",
+		"/foo/bar/{name}/baz/{child}",
+		"/foo/bar/{name}/baz/{child.id}/buzz/{child.thing.id}",
+		"/foo/bar/*/{thing.id}/{cat=**}",
+		"/percent_encoding/{outer={inner}/suffix}",
+		"/foo/bar/*/{thing.id}/{cat=**}:do",
+		"/foo/bar/*/{thing.id}/{cat=**}:cancel",
+		"/foo/bob/{book_id={author}/{isbn}/*}/details",
+		"/foo/blah/{longest_var={long_var.a={medium.a={short.aa}/*/{short.ab}/foo}/*}/{long_var.b={medium.b={short.ba}/*/{short.bb}/foo}/{last=**}}}:details",
+		"/foo%2Fbar/%2A/%2A%2a/{starstar=%2A%2a/**}:%2c",
+		"/trailing/**:slash",
+		"/verb",
+	} {
+		template, variables, err := parsePathTemplate(route)
+		require.NoError(tb, err)
+
+		for _, httpMethod := range []string{http.MethodGet, http.MethodPost} {
+			m := &method{
+				descriptor: &fakeMethodDescriptor{
+					name: fmt.Sprintf("%s %s", httpMethod, route),
+				},
+			}
+			target, err := makeTarget(m, "POST", "*", "*", template, variables)
+			require.NoError(tb, err)
+			err = trie.insert(httpMethod, target)
+			require.NoError(tb, err)
+		}
+	}
+	return &trie
+}
+
+type fakeMethodDescriptor struct {
+	protoreflect.MethodDescriptor
+
+	name    string
+	in, out protoreflect.MessageDescriptor
+}
+
+func (f *fakeMethodDescriptor) Name() protoreflect.Name {
+	return protoreflect.Name(f.name)
+}
+
+func (f *fakeMethodDescriptor) Input() protoreflect.MessageDescriptor {
+	if f.in == nil {
+		f.in = &fakeMessageDescriptor{}
+	}
+	return f.in
+}
+
+func (f *fakeMethodDescriptor) Output() protoreflect.MessageDescriptor {
+	if f.out == nil {
+		f.out = &fakeMessageDescriptor{}
+	}
+	return f.out
+}
+
+type fakeMessageDescriptor struct {
+	protoreflect.MessageDescriptor
+
+	fields protoreflect.FieldDescriptors
+}
+
+func (f *fakeMessageDescriptor) Fields() protoreflect.FieldDescriptors {
+	if f.fields == nil {
+		f.fields = &fakeFieldDescriptors{}
+	}
+	return f.fields
+}
+
+type fakeFieldDescriptors struct {
+	protoreflect.FieldDescriptors
+
+	fields map[protoreflect.Name]protoreflect.FieldDescriptor
+}
+
+func (f *fakeFieldDescriptors) ByName(name protoreflect.Name) protoreflect.FieldDescriptor {
+	fld := f.fields[name]
+	if fld == nil {
+		if f.fields == nil {
+			f.fields = map[protoreflect.Name]protoreflect.FieldDescriptor{}
+		}
+		fld = &fakeFieldDescriptor{name: name}
+		f.fields[name] = fld
+	}
+	return fld
+}
+
+type fakeFieldDescriptor struct {
+	protoreflect.FieldDescriptor
+
+	name protoreflect.Name
+	msg  protoreflect.MessageDescriptor
+	kind protoreflect.Kind
+}
+
+func (f *fakeFieldDescriptor) Name() protoreflect.Name {
+	return f.name
+}
+
+func (f *fakeFieldDescriptor) Cardinality() protoreflect.Cardinality {
+	return protoreflect.Optional
+}
+
+func (f *fakeFieldDescriptor) Kind() protoreflect.Kind {
+	if f.kind > 0 {
+		return f.kind
+	}
+	if f.msg != nil {
+		return protoreflect.MessageKind
+	}
+	return protoreflect.StringKind
+}
+
+func (f *fakeFieldDescriptor) Message() protoreflect.MessageDescriptor {
+	if f.msg == nil {
+		f.msg = &fakeMessageDescriptor{}
+	}
+	return f.msg
+}
+func (f *fakeFieldDescriptor) IsList() bool {
+	return false
+}
